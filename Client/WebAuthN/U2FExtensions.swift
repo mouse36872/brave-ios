@@ -105,7 +105,7 @@ class U2FExtensions: NSObject {
     /// Show when user's key hasn't been inserted yet
     fileprivate let insertKeyPopup = AlertPopupView(imageView: lottieAnimation(for: "webauth_insert_key"),
                                                     title: Strings.insertKeyMessage, message: "", titleWeight: .semibold, titleSize: 21)
-    
+
     /// Show to enter key's pin
     fileprivate let pinVerificationPopup = AlertPopupView(imageView: UIImageView(image: #imageLiteral(resourceName: "enter_pin")),
                                                           title: Strings.pinTitle, message: "",
@@ -237,7 +237,7 @@ class U2FExtensions: NSObject {
             self.handleUserCancel()
             return .flyDown
         }
-                        
+
         [touchKeyPopup, pinVerificationPopup].forEach {
             $0.addButton(title: Strings.keyCancel, tapped: handleCancelButton)
         }
@@ -458,7 +458,7 @@ class U2FExtensions: NSObject {
                 self.sendFIDO2RegistrationError(handle: handle)
                 return
             }
-            fido2Service.execute(makeCredentialRequest) { [weak self] (response, error) in
+            fido2Service.execute(makeCredentialRequest) { [weak self] response, error in
                 guard let self = self else {
                     log.error(U2FErrorMessages.ErrorRegistration.rawValue)
                     return
@@ -656,7 +656,6 @@ class U2FExtensions: NSObject {
                 }
                 self.finalizeFIDO2Authentication(handle: handle, response: response, clientDataJSON: clientDataJSON, error: nil)
             }
-            
         } catch {
             sendFIDO2AuthenticationError(handle: handle, errorDescription: error.localizedDescription)
         }
@@ -1167,7 +1166,7 @@ extension U2FExtensions: TabContentScript {
             currentHandle = handle
             currentMessageType = U2FMessageType(rawValue: name) ?? U2FMessageType.None
             
-            if  YubiKitManager.shared.nfcSession.iso7816SessionState != .open && YubiKitManager.shared.accessorySession.sessionState != .open {
+            if YubiKitManager.shared.nfcSession.iso7816SessionState != .open && YubiKitManager.shared.accessorySession.sessionState != .open {
                 presentInsertKeyModal()
             }
             
