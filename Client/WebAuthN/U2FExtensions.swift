@@ -157,7 +157,6 @@ class U2FExtensions: NSObject {
                     ensureMainThread {
                         self?.observeSessionStateUpdates = false
                         self?.handleSessionStateChange()
-                        self?.observeSessionStateUpdates = true
                     }
                 })
 
@@ -165,7 +164,6 @@ class U2FExtensions: NSObject {
                     ensureMainThread {
                         self?.observeSessionStateUpdates = false
                         self?.handleSessionStateChange()
-                        self?.observeSessionStateUpdates = true
                     }
                 })
             } else {
@@ -280,6 +278,7 @@ class U2FExtensions: NSObject {
         }
         
         YubiKitManager.shared.accessorySession.cancelCommands()
+        observeSessionStateUpdates = true
         u2fActive = false
     }
     
@@ -331,25 +330,16 @@ class U2FExtensions: NSObject {
     }
     
     override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey: Any]?, context: UnsafeMutableRawPointer?) {
-        // We cancel all observers in ObserveValue to avoid excessive queuing on
-        // the main thread when the keys are disconnected continuosly.
-        disableObservers()
-        
         guard context == &U2FExtensions.observationContext else {
             super.observeValue(forKeyPath: keyPath, of: object, change: change, context: context)
             return
         }
         
         switch keyPath {
-        case #keyPath(YKFAccessorySession.sessionState):
-            ensureMainThread {
-                self.handleSessionStateChange()
-                self.enableObservers()
-            }
         case #keyPath(YKFAccessorySession.u2fService.keyState), #keyPath(YKFAccessorySession.fido2Service.keyState):
             ensureMainThread {
+                self.observeServiceStateUpdates = false
                 self.presentInteractWithKeyModal()
-                self.enableObservers()
             }
         default:
             return
@@ -746,6 +736,7 @@ class U2FExtensions: NSObject {
     
     // This modal is presented when the key bootstrap is complete
     private func presentInteractWithKeyModal() {
+        defer {observeServiceStateUpdates = true}
         guard let fido2Service = YubiKitManager.shared.accessorySession.fido2Service else {
             return
         }
@@ -804,17 +795,7 @@ class U2FExtensions: NSObject {
             self.pinVerificationPopup.clearTextField()
         }
     }
-    
-    private func disableObservers() {
-        observeSessionStateUpdates = false
-        observeServiceStateUpdates = false
-    }
-    
-    private func enableObservers() {
-        observeSessionStateUpdates = true
-        observeServiceStateUpdates = true
-    }
-    
+
     private func cleanupFIDO2Authentication(handle: Int) {
         guard let index = fido2AuthHandles.firstIndex(of: handle) else {
             log.error(U2FErrorMessages.ErrorRegistration)
@@ -1071,6 +1052,7 @@ class U2FExtensions: NSObject {
         
         if nfcActive, nfcState == .closed {
             handleUserCancel()
+            return
         }
                 
         if nfcState == .open || accessoryState == .open { // The key session is ready to be used.
