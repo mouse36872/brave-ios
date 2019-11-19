@@ -30,6 +30,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UIViewControllerRestorati
     var rootViewController: UIViewController!
     weak var profile: Profile?
     var tabManager: TabManager!
+    var backgroundMediaHandler: BackgroundMediaHandler?
 
     weak var application: UIApplication?
     var launchOptions: [AnyHashable: Any]?
@@ -119,6 +120,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UIViewControllerRestorati
             class_addMethod(clazz, MenuHelper.SelectorFindInPage, method_getImplementation(swizzledMethod), method_getTypeEncoding(swizzledMethod))
         }
 
+        backgroundMediaHandler = BackgroundMediaHandler(profile: profile)
         self.tabManager = TabManager(prefs: profile.prefs, imageStore: imageStore)
 
         // Make sure current private browsing flag respects the private browsing only user preference
@@ -159,6 +161,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UIViewControllerRestorati
         self.tabManager = nil
         self.browserViewController = nil
         self.rootViewController = nil
+        self.backgroundMediaHandler = nil
     }
 
     /**
@@ -335,7 +338,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UIViewControllerRestorati
 //                application.endBackgroundTask(taskId)
 //            }
 //        } else {
-            profile.shutdown()
+            self.backgroundMediaHandler?.requestShutdown()
             application.endBackgroundTask(taskId)
 //        }
     }
@@ -346,7 +349,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UIViewControllerRestorati
             return
         }
 
-        profile?.shutdown()
+        self.backgroundMediaHandler?.requestShutdown()
     }
 
     func applicationWillEnterForeground(_ application: UIApplication) {
