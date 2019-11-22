@@ -102,6 +102,8 @@ class U2FExtensions: NSObject {
     private var nfcSesionStateObservation: NSKeyValueObservation?
     private var nfcSessionErrorObservation: NSKeyValueObservation?
     
+    private var sceneObserver: SceneObserver?
+    
     // Popup modals presented to the user in different session or key states
     
     /// Show when user has to touch his auth key
@@ -162,16 +164,19 @@ class U2FExtensions: NSObject {
                 accessorySessionStateObservation = accessorySession.observe(\.sessionState, changeHandler: { [weak self] session, change in
                     ensureMainThread {
                         self?.observeSessionStateUpdates = false
+                        if session.sessionState != .closed {
+                            self?.keyType = .accessory
+                        }
                         self?.handleSessionStateChange()
                     }
                 })
 
-                nfcSessionStateObservation = nfcSession.observe(\.iso7816SessionState, changeHandler: { [weak self] session, change in
+                /*nfcSessionStateObservation = nfcSession.observe(\.iso7816SessionState, changeHandler: { [weak self] session, change in
                     ensureMainThread {
                         self?.observeSessionStateUpdates = false
                         self?.handleSessionStateChange()
                     }
-                })
+                })*/
 
                 nfcSessionErrorObservation = nfcSession.observe(\.iso7816SessionErrorCode, changeHandler: { [weak self] session, change in
                     ensureMainThread {
@@ -369,7 +374,7 @@ class U2FExtensions: NSObject {
         fido2RegHandles.append(handle)
         fido2RegisterRequest[handle] = request
         
-        if YubiKitManager.shared.nfcSession.iso7816SessionState == .open || YubiKitManager.shared.accessorySession.sessionState == .open {
+        if keyType == .nfc || YubiKitManager.shared.accessorySession.sessionState == .open {
             handleFIDO2Registration(handle: handle, request: request)
         }
     }
@@ -460,25 +465,48 @@ class U2FExtensions: NSObject {
             
             makeCredentialRequest.excludeList = exclusionList
             
-            guard let fido2Service = self.keyFido2Service else {
-                self.sendFIDO2RegistrationError(handle: handle)
-                return
-            }
-            fido2Service.execute(makeCredentialRequest) { [weak self] response, error in
+            executeKeyRequestWith { [weak self] in
                 guard let self = self else {
-                    log.error(U2FErrorMessages.ErrorRegistration.rawValue)
                     return
                 }
-                guard error == nil else {
-                    self.handleMakeCredential(handle: handle, request: request, error: error)
-                    return
-                }
-                
-                guard let response = response else {
+                guard let fido2Service = self.keyFido2Service else {
                     self.sendFIDO2RegistrationError(handle: handle)
                     return
                 }
-                self.finalizeFIDO2Registration(handle: handle, response: response, clientDataJSON: clientDataJSON.base64EncodedString(), error: nil)
+                fido2Service.execute(makeCredentialRequest) { [weak self] response, error in
+                    guard let self = self else {
+                        log.error(U2FErrorMessages.ErrorRegistration.rawValue)
+                        return
+                    }
+                    guard error == nil else {
+                        self.handleMakeCredential(handle: handle, request: request, error: error)
+                        return
+                    }
+                    
+                    guard let response = response else {
+                        self.sendFIDO2RegistrationError(handle: handle)
+                        return
+                    }
+                    if self.keyType == .accessory {
+                        self.finalizeFIDO2Registration(handle: handle, response: response, clientDataJSON: clientDataJSON.base64EncodedString(), error: nil)
+                    } else {
+                        guard #available(iOS 13.0, *) else {
+                            self.sendFIDO2RegistrationError(handle: handle)
+                            return
+                        }
+                        
+                        self.sceneObserver = SceneObserver(sceneActivationClosure: {  [weak self] in
+                            guard let self = self else {
+                                return
+                            }
+                            self.finalizeFIDO2Registration(handle: handle, response: response, clientDataJSON: clientDataJSON.base64EncodedString(), error: nil)
+                            self.sceneObserver = nil
+                        })
+
+                        // Stop the session to dismiss the Core NFC system UI.
+                        YubiKitManager.shared.nfcSession.stopIso7816Session()
+                    }
+                }
             }
         } catch {
             sendFIDO2RegistrationError(handle: handle, errorDescription: error.localizedDescription)
@@ -532,20 +560,44 @@ class U2FExtensions: NSObject {
             return
         }
         
-        handlePinVerificationRequired { [weak self] (error) in
+        let requestExecutionClosure = { [weak self] in
             guard let self = self else {
                 return
             }
-            self.cleanupPinVerificationPopup()
-            ensureMainThread {
-                self.verificationPendingPopup.dismissWithType(dismissType: .flyDown)
+            self.handlePinVerificationRequired { [weak self] (error) in
+                guard let self = self else {
+                    return
+                }
+                self.cleanupPinVerificationPopup()
+                ensureMainThread {
+                    self.verificationPendingPopup.dismissWithType(dismissType: .flyDown)
+                }
+                
+                if error == true {
+                    self.sendFIDO2RegistrationError(handle: handle)
+                    return
+                }
+                self.handleFIDO2Registration(handle: handle, request: request)
             }
-            
-            if error == true {
+        }
+        
+        // PIN verification is required for the Make Credential request.
+        if keyType == .accessory {
+            requestExecutionClosure()
+        } else {
+            guard #available(iOS 13.0, *) else {
                 self.sendFIDO2RegistrationError(handle: handle)
                 return
             }
-            self.handleFIDO2Registration(handle: handle, request: request)
+            
+            YubiKitManager.shared.nfcSession.stopIso7816Session()
+            self.sceneObserver = SceneObserver(sceneActivationClosure: {  [weak self] in
+                guard let self = self else {
+                    return
+                }
+                requestExecutionClosure()
+                self.sceneObserver = nil
+            })
         }
         return
     }
@@ -576,7 +628,7 @@ class U2FExtensions: NSObject {
         fido2AuthHandles.append(handle)
         fido2AuthRequest[handle] = request
         
-        if YubiKitManager.shared.nfcSession.iso7816SessionState == .open || YubiKitManager.shared.accessorySession.sessionState == .open {
+        if keyType == .nfc || YubiKitManager.shared.accessorySession.sessionState == .open {
             handleFIDO2Authentication(handle: handle, request: request)
         }
     }
@@ -639,26 +691,50 @@ class U2FExtensions: NSObject {
                 getAssertionRequest.allowList = allowList
             }
 
-            guard let fido2Service = self.keyFido2Service else {
-                self.sendFIDO2AuthenticationError(handle: handle)
-                return
-            }
-            fido2Service.execute(getAssertionRequest) { [weak self] response, error in
+            executeKeyRequestWith { [weak self] in
                 guard let self = self else {
-                    log.error(U2FErrorMessages.ErrorAuthentication.rawValue)
                     return
                 }
-                guard error == nil else {
-                    self.handleGetAssertion(handle: handle, request: request, error: error)
-                    return
-                }
-                
-                // The reponse from the key must not be empty at this point.
-                guard let response = response else {
+                guard let fido2Service = self.keyFido2Service else {
                     self.sendFIDO2AuthenticationError(handle: handle)
                     return
                 }
-                self.finalizeFIDO2Authentication(handle: handle, response: response, clientDataJSON: clientDataJSON, error: nil)
+                
+                fido2Service.execute(getAssertionRequest) { [weak self] response, error in
+                    guard let self = self else {
+                        log.error(U2FErrorMessages.ErrorAuthentication.rawValue)
+                        return
+                    }
+                    guard error == nil else {
+                        self.handleGetAssertion(handle: handle, request: request, error: error)
+                        return
+                    }
+                    
+                    // The reponse from the key must not be empty at this point.
+                    guard let response = response else {
+                        self.sendFIDO2AuthenticationError(handle: handle)
+                        return
+                    }
+                    if self.keyType == .accessory {
+                        self.finalizeFIDO2Authentication(handle: handle, response: response, clientDataJSON: clientDataJSON, error: nil)
+                    } else {
+                        guard #available(iOS 13.0, *) else {
+                            self.sendFIDO2RegistrationError(handle: handle)
+                            return
+                        }
+                        
+                        self.sceneObserver = SceneObserver(sceneActivationClosure: {  [weak self] in
+                            guard let self = self else {
+                                return
+                            }
+                            self.finalizeFIDO2Authentication(handle: handle, response: response, clientDataJSON: clientDataJSON, error: nil)
+                            self.sceneObserver = nil
+                        })
+
+                        // Stop the session to dismiss the Core NFC system UI.
+                        YubiKitManager.shared.nfcSession.stopIso7816Session()
+                    }
+                }
             }
         } catch {
             sendFIDO2AuthenticationError(handle: handle, errorDescription: error.localizedDescription)
@@ -740,10 +816,8 @@ class U2FExtensions: NSObject {
         let currentURL = self.tab?.url?.host ?? ""
         if #available(iOS 13.0, *), YubiKitDeviceCapabilities.supportsISO7816NFCTags {
             YubiKitExternalLocalization.nfcScanAlertMessage = Strings.selectKey + currentURL
-            if !nfcActive {
-                nfcActive = true
-                YubiKitManager.shared.nfcSession.startIso7816Session()
-            }
+            nfcActive = true
+            keyType = .nfc
         } else {
             insertKeyPopup.update(title: Strings.insertKeyMessage + currentURL)
             insertKeyPopup.showWithType(showType: .flyUp)
@@ -788,19 +862,27 @@ class U2FExtensions: NSObject {
     private func verifyPin(completion: @escaping (Bool) -> Void) -> PopupViewDismissType {
         guard
             let pin = pinVerificationPopup.text, !pin.isEmpty,
-            let fido2Service = YubiKitManager.shared.accessorySession.fido2Service,
             let verifyPinRequest = YKFKeyFIDO2VerifyPinRequest(pin: pin) else {
                 completion(true)
                 return .flyDown
             }
-            
-        fido2Service.execute(verifyPinRequest) { (error) in
-            guard error == nil else {
+        self.executeKeyRequestWith { [weak self] in
+            guard let self = self else {
+                return
+            }
+            guard let fido2Service = self.keyFido2Service else {
                 completion(true)
                 return
             }
-            completion(false)
-            return
+            
+            fido2Service.execute(verifyPinRequest) { (error) in
+                guard error == nil else {
+                    completion(true)
+                    return
+                }
+                completion(false)
+                return
+            }
         }
         return .flyDown
     }
@@ -839,7 +921,7 @@ class U2FExtensions: NSObject {
             requestId[handle] = id
         }
         
-        if YubiKitManager.shared.nfcSession.iso7816SessionState == .open || YubiKitManager.shared.accessorySession.sessionState == .open {
+        if keyType == .nfc || YubiKitManager.shared.accessorySession.sessionState == .open {
             handleFIDORegistration(handle: handle, request: request, requestId: id)
         }
     }
@@ -852,52 +934,79 @@ class U2FExtensions: NSObject {
             sendFIDORegistrationError(handle: handle, requestId: requestId, errorCode: U2FErrorCodes.bad_request)
             return
         }
-        
-        guard let u2fservice = self.keyU2fService else {
-            self.sendFIDORegistrationError(handle: handle, requestId: requestId, errorCode: U2FErrorCodes.other_error)
-            return
-        }
-        
-        u2fservice.execute(registerRequest) { [weak self] response, error in
+        executeKeyRequestWith { [weak self] in
             guard let self = self else {
-                log.error(U2FErrorMessages.Error.rawValue)
                 return
             }
             
-            guard error == nil else {
-                let errorMessage = error?.localizedDescription ?? Strings.U2FRegistrationError
-                self.sendFIDORegistrationError(handle: handle, requestId: requestId, errorCode: U2FErrorCodes.other_error, errorMessage: errorMessage)
-                return
-            }
-            guard let clientData = response?.clientData.websafeBase64String() else {
-                self.sendFIDORegistrationError(handle: handle, requestId: requestId, errorCode: U2FErrorCodes.other_error)
-                return
-            }
-            guard let registrationData = response?.registrationData.websafeBase64String() else {
+            guard let u2fservice = self.keyU2fService else {
                 self.sendFIDORegistrationError(handle: handle, requestId: requestId, errorCode: U2FErrorCodes.other_error)
                 return
             }
             
-            self.cleanupFIDORegistration(handle: handle)
-            if requestId >= 0 {
-                ensureMainThread {
-                    self.tab?.webView?.evaluateJavaScript("u2f.postLowLevelRegister(\(requestId), \(true), '\(request.version)', '\(registrationData)', '\(clientData)', \(defaultErrorCode), '')", completionHandler: { _, error in
-                        if error != nil {
-                            let errorDescription = error?.localizedDescription ?? U2FErrorMessages.ErrorRegistration.rawValue
-                            log.error(errorDescription)
-                        }
-                }) }
-                return
-            }
+            u2fservice.execute(registerRequest) { [weak self] response, error in
+                guard let self = self else {
+                    log.error(U2FErrorMessages.Error.rawValue)
+                    return
+                }
+                
+                guard error == nil else {
+                    let errorMessage = error?.localizedDescription ?? Strings.U2FRegistrationError
+                    self.sendFIDORegistrationError(handle: handle, requestId: requestId, errorCode: U2FErrorCodes.other_error, errorMessage: errorMessage)
+                    return
+                }
+                guard let clientData = response?.clientData.websafeBase64String() else {
+                    self.sendFIDORegistrationError(handle: handle, requestId: requestId, errorCode: U2FErrorCodes.other_error)
+                    return
+                }
+                guard let registrationData = response?.registrationData.websafeBase64String() else {
+                    self.sendFIDORegistrationError(handle: handle, requestId: requestId, errorCode: U2FErrorCodes.other_error)
+                    return
+                }
+                
+                if self.keyType == .accessory {
+                    self.finalizeFIDORegistration(requestId: requestId, handle: handle, version: request.version, registrationData: registrationData, clientData: clientData)
+                } else {
+                    guard #available(iOS 13.0, *) else {
+                        self.sendFIDORegistrationError(handle: handle, requestId: requestId, errorCode: U2FErrorCodes.other_error)
+                        return
+                    }
 
+                    self.sceneObserver = SceneObserver(sceneActivationClosure: {  [weak self] in
+                        guard let self = self else {
+                            return
+                        }
+                        self.finalizeFIDORegistration(requestId: requestId, handle: handle, version: request.version, registrationData: registrationData, clientData: clientData)
+                        self.sceneObserver = nil
+                    })
+
+                    // Stop the session to dismiss the Core NFC system UI.
+                    YubiKitManager.shared.nfcSession.stopIso7816Session()
+                }
+            }
+        }
+    }
+    
+    private func finalizeFIDORegistration(requestId: Int, handle: Int, version: String, registrationData: String, clientData: String) {
+        cleanupFIDORegistration(handle: handle)
+        if requestId >= 0 {
             ensureMainThread {
-                self.tab?.webView?.evaluateJavaScript("u2f.postRegister('\(handle)', \(true), '\(request.version)', '\(registrationData)', '\(clientData)', \(defaultErrorCode), '')", completionHandler: { _, error in
+                self.tab?.webView?.evaluateJavaScript("u2f.postLowLevelRegister(\(requestId), \(true), '\(version)', '\(registrationData)', '\(clientData)', \(defaultErrorCode), '')", completionHandler: { _, error in
                     if error != nil {
                         let errorDescription = error?.localizedDescription ?? U2FErrorMessages.ErrorRegistration.rawValue
                         log.error(errorDescription)
                     }
             }) }
+            return
         }
+
+        ensureMainThread {
+            self.tab?.webView?.evaluateJavaScript("u2f.postRegister('\(handle)', \(true), '\(version)', '\(registrationData)', '\(clientData)', \(defaultErrorCode), '')", completionHandler: { _, error in
+                if error != nil {
+                    let errorDescription = error?.localizedDescription ?? U2FErrorMessages.ErrorRegistration.rawValue
+                    log.error(errorDescription)
+                }
+        }) }
     }
     
     private func sendFIDORegistrationError(handle: Int, requestId: Int, errorCode: U2FErrorCodes, errorMessage: String = Strings.U2FRegistrationError) {
@@ -943,7 +1052,7 @@ class U2FExtensions: NSObject {
             requestId[handle] = id
         }
         
-        if YubiKitManager.shared.accessorySession.sessionState == .open || YubiKitManager.shared.nfcSession.iso7816SessionState == .open {
+        if keyType == .nfc || YubiKitManager.shared.nfcSession.iso7816SessionState == .open {
             handleFIDOAuthentication(handle: handle, keys: keys, requestId: id)
         }
     }
@@ -968,63 +1077,91 @@ class U2FExtensions: NSObject {
                 return
             }
             
-            guard let u2fservice = self.keyU2fService else {
-                self.sendFIDOAuthenticationError(handle: handle, requestId: requestId, errorCode: U2FErrorCodes.other_error)
-                return
-            }
-            u2fservice.execute(signRequest) { [weak self] response, error in
+            executeKeyRequestWith { [weak self] in
                 guard let self = self else {
-                    log.error(U2FErrorMessages.ErrorAuthentication.rawValue)
                     return
                 }
-                
-                count -= 1
-                self.fidoRequests[handle] = count
-                
-                guard error == nil else {
-                    if count == 0 {
-                        let errorMessage = error?.localizedDescription ?? Strings.U2FAuthenticationError
-                        self.sendFIDOAuthenticationError(handle: handle, requestId: requestId, errorCode: U2FErrorCodes.other_error, errorMessage: errorMessage)
+            
+                guard let u2fservice = self.keyU2fService else {
+                    self.sendFIDOAuthenticationError(handle: handle, requestId: requestId, errorCode: U2FErrorCodes.other_error)
+                    return
+                }
+                u2fservice.execute(signRequest) { [weak self] response, error in
+                    guard let self = self else {
+                        log.error(U2FErrorMessages.ErrorAuthentication.rawValue)
+                        return
                     }
-                    return
-                }
-                guard let keyHandle = response?.keyHandle else {
-                    self.sendFIDOAuthenticationError(handle: handle, requestId: requestId, errorCode: U2FErrorCodes.other_error)
-                    return
-                }
-                guard let signature = response?.signature.websafeBase64String() else {
-                    self.sendFIDOAuthenticationError(handle: handle, requestId: requestId, errorCode: U2FErrorCodes.other_error)
-                    return
-                }
-                guard let clientData = response?.clientData.websafeBase64String() else {
-                    self.sendFIDOAuthenticationError(handle: handle, requestId: requestId, errorCode: U2FErrorCodes.other_error)
-                    return
-                }
-                
-                self.fidoRequests[handle] = authSuccess
-                
-                self.cleanupFIDOAuthentication(handle: handle)
-                if requestId >= 0 {
-                    ensureMainThread {
-                        self.tab?.webView?.evaluateJavaScript("u2f.postLowLevelSign(\(requestId), \(true), '\(keyHandle)', '\(signature)', '\(clientData)', \(defaultErrorCode), '')", completionHandler: { _, error in
-                            if error != nil {
-                                let errorDescription = error?.localizedDescription ?? U2FErrorMessages.ErrorAuthentication.rawValue
-                                log.error(errorDescription)
-                            }
-                    }) }
-                    return
-                }
-
-                ensureMainThread {
-                    self.tab?.webView?.evaluateJavaScript("u2f.postSign('\(handle)', \(true), '\(keyHandle)', '\(signature)', '\(clientData)', \(defaultErrorCode), '')", completionHandler: { _, error in
-                        if error != nil {
-                            let errorDescription = error?.localizedDescription ?? U2FErrorMessages.ErrorAuthentication.rawValue
-                            log.error(errorDescription)
+                    
+                    count -= 1
+                    self.fidoRequests[handle] = count
+                    
+                    guard error == nil else {
+                        if count == 0 {
+                            let errorMessage = error?.localizedDescription ?? Strings.U2FAuthenticationError
+                            self.sendFIDOAuthenticationError(handle: handle, requestId: requestId, errorCode: U2FErrorCodes.other_error, errorMessage: errorMessage)
                         }
-                }) }
+                        return
+                    }
+                    guard let keyHandle = response?.keyHandle else {
+                        self.sendFIDOAuthenticationError(handle: handle, requestId: requestId, errorCode: U2FErrorCodes.other_error)
+                        return
+                    }
+                    guard let signature = response?.signature.websafeBase64String() else {
+                        self.sendFIDOAuthenticationError(handle: handle, requestId: requestId, errorCode: U2FErrorCodes.other_error)
+                        return
+                    }
+                    guard let clientData = response?.clientData.websafeBase64String() else {
+                        self.sendFIDOAuthenticationError(handle: handle, requestId: requestId, errorCode: U2FErrorCodes.other_error)
+                        return
+                    }
+                    
+                    if self.keyType == .accessory {
+                        self.finalizeFIDOAuthentication(requestId: requestId, handle: handle, keyHandle: keyHandle, signature: signature, clientData: clientData)
+                    } else {
+                        guard #available(iOS 13.0, *) else {
+                            self.sendFIDORegistrationError(handle: handle, requestId: requestId, errorCode: U2FErrorCodes.other_error)
+                            return
+                        }
+
+                        self.sceneObserver = SceneObserver(sceneActivationClosure: {  [weak self] in
+                            guard let self = self else {
+                                return
+                            }
+                            self.finalizeFIDOAuthentication(requestId: requestId, handle: handle, keyHandle: keyHandle, signature: signature, clientData: clientData)
+                            self.sceneObserver = nil
+                        })
+
+                        // Stop the session to dismiss the Core NFC system UI.
+                        YubiKitManager.shared.nfcSession.stopIso7816Session()
+                    }
+                    self.fidoRequests[handle] = authSuccess
+                }
             }
         }
     }
+    
+     private func finalizeFIDOAuthentication(requestId: Int, handle: Int, keyHandle: String, signature: String, clientData: String) {
+        cleanupFIDOAuthentication(handle: handle)
+        if requestId >= 0 {
+            ensureMainThread {
+                self.tab?.webView?.evaluateJavaScript("u2f.postLowLevelSign(\(requestId), \(true), '\(keyHandle)', '\(signature)', '\(clientData)', \(defaultErrorCode), '')", completionHandler: { _, error in
+                    if error != nil {
+                        let errorDescription = error?.localizedDescription ?? U2FErrorMessages.ErrorAuthentication.rawValue
+                        log.error(errorDescription)
+                    }
+            }) }
+            return
+        }
+
+        ensureMainThread {
+            self.tab?.webView?.evaluateJavaScript("u2f.postSign('\(handle)', \(true), '\(keyHandle)', '\(signature)', '\(clientData)', \(defaultErrorCode), '')", completionHandler: { _, error in
+                if error != nil {
+                    let errorDescription = error?.localizedDescription ?? U2FErrorMessages.ErrorAuthentication.rawValue
+                    log.error(errorDescription)
+                }
+        }) }
+    }
+    
     
     private func sendFIDOAuthenticationError(handle: Int, requestId: Int, errorCode: U2FErrorCodes, errorMessage: String = Strings.U2FAuthenticationError) {
         cleanupFIDOAuthentication(handle: handle)
@@ -1060,6 +1197,52 @@ class U2FExtensions: NSObject {
         cleanup()
     }
     
+    private func executeKeyRequestWith(execution: @escaping () -> Void) {
+        if keyType == .accessory {
+            // Execute the request right away.
+            execution()
+        } else {
+            guard #available(iOS 13.0, *) else {
+                sendJSError()
+                return
+            }
+                        
+            guard let nfcSession = YubiKitManager.shared.nfcSession as? YKFNFCSession else {
+                sendJSError()
+                return
+            }
+            
+            self.nfcActive = true
+            
+            if nfcSession.iso7816SessionState == .open {
+                execution()
+                return
+            }
+            
+            // The ISO7816 session is started only when required since it's blocking the application UI with the NFC system action sheet.
+            YubiKitManager.shared.nfcSession.startIso7816Session()
+            
+            // Execute the request after the key(tag) is connected.
+            nfcSesionStateObservation = nfcSession.observe(\.iso7816SessionState, changeHandler: { [weak self] session, change in
+                if session.iso7816SessionState == .open {
+                    execution()
+                    self?.nfcActive = false
+                    self?.nfcSesionStateObservation = nil // remove the observation
+                }
+                
+                if self?.nfcActive ?? false, session.iso7816SessionState == .closed {
+                    // Session invalidated by user error is triggered for many cases
+                    // and is not a consistent way to track when user explicitly clicked
+                    // cancel. So we track for instances when nfcState is set to closed
+                    // without calling stopIso7816session
+                    self?.sendJSError()
+                    self?.nfcActive = false
+                    self?.nfcSesionStateObservation = nil // remove the observation
+                }
+            })
+        }
+    }
+    
     private func handleSessionStateChange() {
         defer {
             observeSessionStateUpdates = true
@@ -1069,21 +1252,8 @@ class U2FExtensions: NSObject {
 
         let accessoryState = YubiKitManager.shared.accessorySession.sessionState
         let nfcState = YubiKitManager.shared.nfcSession.iso7816SessionState
-        
-        // Session invalidated by user error is triggered for many cases
-        // and is not a consistent way to track when user explicitly clicked
-        // cancel. So we track for instances when nfcState is set to closed
-        // without calling stopIso7816session
-        if nfcActive, nfcState == .closed, #available(iOS 13.0, *) {
-            sendJSError()
-            return
-        }
 
-        if nfcState == .open || accessoryState == .open { // The key session is ready to be used.
-            if nfcState == .open {
-                keyType = .nfc
-            }
-
+        if keyType == .nfc || accessoryState == .open { // The key session is ready to be used.
             if accessoryState == .open {
                 if nfcActive, #available(iOS 13.0, *) {
                     nfcActive = false
