@@ -73,11 +73,6 @@ private enum FIDO2ViewControllerKeyType {
     case nfc
 }
 
-private enum NFCErrorMessages: Int {
-    case SessionInvalidatedByUser = 200
-    case SystemResourceUnavailable = 203
-}
-
 class U2FExtensions: NSObject {
     fileprivate weak var tab: Tab?
     
@@ -100,8 +95,6 @@ class U2FExtensions: NSObject {
     fileprivate static var observationContext = 0
     
     private var nfcSesionStateObservation: NSKeyValueObservation?
-    private var nfcSessionErrorObservation: NSKeyValueObservation?
-    
     private var sceneObserver: SceneObserver?
     
     // Popup modals presented to the user in different session or key states
@@ -113,7 +106,7 @@ class U2FExtensions: NSObject {
     /// Show when user's key hasn't been inserted yet
     fileprivate let insertKeyPopup = AlertPopupView(imageView: lottieAnimation(for: "webauth_insert_key"),
                                                     title: Strings.insertKeyMessage, message: "", titleWeight: .semibold, titleSize: 21)
-
+ 
     /// Show to enter key's pin
     fileprivate let pinVerificationPopup = AlertPopupView(imageView: UIImageView(image: #imageLiteral(resourceName: "enter_pin")),
                                                           title: Strings.pinTitle, message: "",
@@ -156,10 +149,6 @@ class U2FExtensions: NSObject {
                 return
             }
             
-            guard let nfcSession = YubiKitManager.shared.nfcSession as? YKFNFCSession else {
-                return
-            }
-            
             if observeSessionStateUpdates {
                 accessorySessionStateObservation = accessorySession.observe(\.sessionState, changeHandler: { [weak self] session, change in
                     ensureMainThread {
@@ -170,31 +159,8 @@ class U2FExtensions: NSObject {
                         self?.handleSessionStateChange()
                     }
                 })
-
-                /*nfcSessionStateObservation = nfcSession.observe(\.iso7816SessionState, changeHandler: { [weak self] session, change in
-                    ensureMainThread {
-                        self?.observeSessionStateUpdates = false
-                        self?.handleSessionStateChange()
-                    }
-                })*/
-
-                nfcSessionErrorObservation = nfcSession.observe(\.iso7816SessionErrorCode, changeHandler: { [weak self] session, change in
-                    ensureMainThread {
-                        self?.observeSessionStateUpdates = false
-                        if session.iso7816SessionErrorCode == NFCErrorMessages.SystemResourceUnavailable.rawValue {
-                            self?.nfcActive = false
-                            if #available(iOS 13.0, *) {
-                                //To-Do: May be add a counter if NFC keeps failing
-                                session.stopIso7816Session()
-                                session.startIso7816Session()
-                            }
-                        }
-                        self?.observeSessionStateUpdates = true
-                    }
-                })
             } else {
                 accessorySessionStateObservation = nil
-                nfcSesionStateObservation = nil
             }
         }
     }
@@ -294,13 +260,13 @@ class U2FExtensions: NSObject {
     }
     
     private func cleanup() {
-        if #available(iOS 13.0, *) {
+        if keyType == .nfc, #available(iOS 13.0, *) {
             YubiKitManager.shared.nfcSession.cancelCommands()
             nfcActive = false
-            YubiKitManager.shared.nfcSession.stopIso7816Session()
+        } else {
+            YubiKitManager.shared.accessorySession.cancelCommands()
         }
-        
-        YubiKitManager.shared.accessorySession.cancelCommands()
+        keyType = .unknown
         currentTabId = ""
         u2fActive = false
     }
@@ -473,6 +439,8 @@ class U2FExtensions: NSObject {
                     self.sendFIDO2RegistrationError(handle: handle)
                     return
                 }
+                
+                self.presentInteractWithKeyModal()
                 fido2Service.execute(makeCredentialRequest) { [weak self] response, error in
                     guard let self = self else {
                         log.error(U2FErrorMessages.ErrorRegistration.rawValue)
@@ -700,6 +668,7 @@ class U2FExtensions: NSObject {
                     return
                 }
                 
+                self.presentInteractWithKeyModal()
                 fido2Service.execute(getAssertionRequest) { [weak self] response, error in
                     guard let self = self else {
                         log.error(U2FErrorMessages.ErrorAuthentication.rawValue)
@@ -836,9 +805,9 @@ class U2FExtensions: NSObject {
         guard let u2fService = YubiKitManager.shared.accessorySession.u2fService else {
             return
         }
-
+        
         // The modal should be visible for the tab where the U2F API is active
-        if u2fActive && tab?.id == currentTabId && (fido2Service.keyState == .touchKey || u2fService.keyState == .YKFKeyU2FServiceKeyStateTouchKey) {
+        if u2fActive && keyType == .accessory && tab?.id == currentTabId && (fido2Service.keyState == .touchKey || u2fService.keyState == .YKFKeyU2FServiceKeyStateTouchKey) {
             let currentURL = self.tab?.url?.host ?? ""
             touchKeyPopup.update(title: Strings.touchKeyMessage + currentURL)
             touchKeyPopup.showWithType(showType: .flyUp)
@@ -944,6 +913,7 @@ class U2FExtensions: NSObject {
                 return
             }
             
+            self.presentInteractWithKeyModal()
             u2fservice.execute(registerRequest) { [weak self] response, error in
                 guard let self = self else {
                     log.error(U2FErrorMessages.Error.rawValue)
@@ -1086,6 +1056,7 @@ class U2FExtensions: NSObject {
                     self.sendFIDOAuthenticationError(handle: handle, requestId: requestId, errorCode: U2FErrorCodes.other_error)
                     return
                 }
+                self.presentInteractWithKeyModal()
                 u2fservice.execute(signRequest) { [weak self] response, error in
                     guard let self = self else {
                         log.error(U2FErrorMessages.ErrorAuthentication.rawValue)
@@ -1247,11 +1218,8 @@ class U2FExtensions: NSObject {
         defer {
             observeSessionStateUpdates = true
         }
-
-        setCurrentTabId()
-
+        
         let accessoryState = YubiKitManager.shared.accessorySession.sessionState
-        let nfcState = YubiKitManager.shared.nfcSession.iso7816SessionState
 
         if keyType == .nfc || accessoryState == .open { // The key session is ready to be used.
             if accessoryState == .open {
@@ -1334,21 +1302,21 @@ extension U2FExtensions: TabContentScript {
     
     func userContentController(_ userContentController: WKUserContentController, didReceiveScriptMessage message: WKScriptMessage) {
         if message.name == "U2F", let body = message.body as? NSDictionary {
-            
-            log.info("Starting")
-            log.info(nfcActive)
-            log.info(YubiKitManager.shared.nfcSession.iso7816SessionState == .closed)
-
             guard let name = body["name"] as? String, let handle = body["handle"] as? Int else {
                 log.error(U2FErrorMessages.Error)
                 return
             }
             
             u2fActive = true
+            setCurrentTabId()
             currentHandle = handle
             currentMessageType = U2FMessageType(rawValue: name) ?? U2FMessageType.None
             
-            if YubiKitManager.shared.nfcSession.iso7816SessionState != .open && YubiKitManager.shared.accessorySession.sessionState != .open {
+            if YubiKitManager.shared.nfcSession.iso7816SessionState == .open {
+                keyType = .nfc
+            } else if  YubiKitManager.shared.accessorySession.sessionState == .open {
+                keyType = .accessory
+            } else {
                 presentInsertKeyModal()
             }
             
