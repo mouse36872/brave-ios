@@ -440,9 +440,6 @@ class U2FExtensions: NSObject {
                     return
                 }
                 
-                ensureMainThread {
-                    self.presentInteractWithKeyModal()
-                }
                 fido2Service.execute(makeCredentialRequest) { [weak self] response, error in
                     guard let self = self else {
                         log.error(U2FErrorMessages.ErrorRegistration.rawValue)
@@ -669,9 +666,6 @@ class U2FExtensions: NSObject {
                     return
                 }
                 
-                ensureMainThread {
-                    self.presentInteractWithKeyModal()
-                }
                 fido2Service.execute(getAssertionRequest) { [weak self] response, error in
                     guard let self = self else {
                         log.error(U2FErrorMessages.ErrorAuthentication.rawValue)
@@ -949,10 +943,6 @@ class U2FExtensions: NSObject {
                 return
             }
             
-            ensureMainThread {
-                self.presentInteractWithKeyModal()
-            }
-            
             u2fservice.execute(registerRequest) { [weak self] response, error in
                 guard let self = self else {
                     log.error(U2FErrorMessages.Error.rawValue)
@@ -1095,9 +1085,7 @@ class U2FExtensions: NSObject {
                     self.sendFIDOAuthenticationError(handle: handle, requestId: requestId, errorCode: U2FErrorCodes.other_error)
                     return
                 }
-                ensureMainThread {
-                    self.presentInteractWithKeyModal()
-                }
+
                 u2fservice.execute(signRequest) { [weak self] response, error in
                     guard let self = self else {
                         log.error(U2FErrorMessages.ErrorAuthentication.rawValue)
