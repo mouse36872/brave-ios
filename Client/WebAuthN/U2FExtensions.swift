@@ -536,7 +536,6 @@ class U2FExtensions: NSObject {
                 guard let self = self else {
                     return
                 }
-                self.cleanupPinVerificationPopup()
                 ensureMainThread {
                     self.verificationPendingPopup.dismissWithType(dismissType: .flyDown)
                 }
@@ -752,20 +751,48 @@ class U2FExtensions: NSObject {
             return
         }
         
-        handlePinVerificationRequired { [weak self] (error) in
+        let requestExecutionClosure = { [weak self] in
             guard let self = self else {
                 return
             }
-            self.cleanupPinVerificationPopup()
-            ensureMainThread {
-                self.verificationPendingPopup.dismissWithType(dismissType: .flyDown)
+            self.handlePinVerificationRequired { [weak self] (error) in
+                guard let self = self else {
+                    return
+                }
+                ensureMainThread {
+                    self.verificationPendingPopup.dismissWithType(dismissType: .flyDown)
+                }
+                if error == true {
+                    self.sendFIDO2AuthenticationError(handle: handle)
+                    return
+                }
+                self.handleFIDO2Authentication(handle: handle, request: request)
             }
-            if error == true {
-                self.sendFIDO2AuthenticationError(handle: handle)
+        }
+        
+        // PIN verification is required for the Make Credential request.
+        if keyType == .accessory {
+            requestExecutionClosure()
+        } else {
+            guard #available(iOS 13.0, *) else {
+                self.sendFIDO2RegistrationError(handle: handle)
                 return
             }
-            self.handleFIDO2Authentication(handle: handle, request: request)
+            
+            // In case of NFC stop the session to allow the user to input the PIN (the NFC system action sheet blocks any interaction).
+            YubiKitManager.shared.nfcSession.stopIso7816Session()
+            
+            // Observe the scene activation to detect when the Core NFC system UI goes away.
+            // For more details about this solution check the comments on SceneObserver.
+            self.sceneObserver = SceneObserver(sceneActivationClosure: {  [weak self] in
+                guard let self = self else {
+                    return
+                }
+                requestExecutionClosure()
+                self.sceneObserver = nil
+            })
         }
+        
         return
     }
     
@@ -820,8 +847,12 @@ class U2FExtensions: NSObject {
         ensureMainThread {
             let currentURL = self.tab?.url?.host ?? ""
             self.pinVerificationPopup.addButton(title: Strings.confirmPin, type: .primary) { [weak self] in
-                self?.verificationPendingPopup.update(title: Strings.verificationPending + currentURL)
-                self?.verificationPendingPopup.showWithType(showType: .flyUp)
+                // Only show Verification UI for accessory since Core NFC UI
+                // is displayed on top of it
+                if self?.keyType == .accessory {
+                    self?.verificationPendingPopup.update(title: Strings.verificationPending + currentURL)
+                    self?.verificationPendingPopup.showWithType(showType: .flyUp)
+                }
                 return self?.verifyPin(completion: completion) ?? .flyDown
             }
             self.pinVerificationPopup.showWithType(showType: .flyUp)
@@ -835,6 +866,7 @@ class U2FExtensions: NSObject {
                 completion(true)
                 return .flyDown
             }
+        self.cleanupPinVerificationPopup()
         self.executeKeyRequestWith { [weak self] in
             guard let self = self else {
                 return
@@ -1132,7 +1164,6 @@ class U2FExtensions: NSObject {
                 }
         }) }
     }
-    
     
     private func sendFIDOAuthenticationError(handle: Int, requestId: Int, errorCode: U2FErrorCodes, errorMessage: String = Strings.U2FAuthenticationError) {
         cleanupFIDOAuthentication(handle: handle)
