@@ -94,11 +94,11 @@ SRCDIR=$PWD
 rm -rf $YUBIKIT_DIR
 rm -rf $YUBIKIT_OUT
 
-git clone -b 7816_error --single-branch https://github.com/jumde/yubikit-ios/ $YUBIKIT_DIR
+git clone -b 3.0.0-Preview --single-branch https://github.com/Yubico/yubikit-ios/ $YUBIKIT_DIR
 
 mkdir -p $SRCDIR/$YUBIKIT_OUT/include
 pushd $YUBIKIT_DIR/YubiKit
 sh build.sh > yubikit.log 2>&1
-cp -r releases/YubiKit/YubiKit/debug_universal/  $SRCDIR/$YUBIKIT_OUT/
+cp -r releases/YubiKit/YubiKit/release_universal/  $SRCDIR/$YUBIKIT_OUT/
 cp -r releases/YubiKit/YubiKit/include/  $SRCDIR/$YUBIKIT_OUT/include/
 popd
