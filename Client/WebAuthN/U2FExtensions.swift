@@ -226,7 +226,7 @@ class U2FExtensions: NSObject {
             return .flyDown
         }
 
-        [touchKeyPopup, pinVerificationPopup].forEach {
+        [touchKeyPopup, insertKeyPopup, pinVerificationPopup].forEach {
             $0.addButton(title: Strings.keyCancel, tapped: handleCancelButton)
         }
         
